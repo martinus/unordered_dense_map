@@ -73,6 +73,7 @@ test_sources = [
     'unit/swap.cpp',
     'unit/transparent.cpp',
     'unit/try_emplace.cpp',
+    'unit/tuple_hash.cpp',
     'unit/unique_ptr.cpp',
     'unit/unordered_set.cpp',
     'unit/vectorofmaps.cpp',
@@ -88,6 +89,7 @@ foreach arg : [
             '-Wno-stringop-overflow', # g++ error in fmtlib
             '-Warith-conversion',
             '-Wshadow=global',
+            '-Wno-array-bounds', # gcc 13 gives incorrect warning
 
             # gcc / clang
             '-Wconversion',
@@ -154,6 +156,7 @@ cpp_args += [
 link_args += [
     #'-fsanitize=undefined,address',
     #'-fno-sanitize=thread'
+    #'-Wl,-shuffle-sections' # for benchmarking with mold linker
 ]
 
 test_exe = executable(
@@ -172,6 +175,7 @@ test_exe = executable(
         # disable these two if you don't want them
         #dependency('boost'),
         #dependency('absl_container', default_options: ['warning_level=0', 'werror=false'])
+        # dependency('absl_hash', method: 'builtin', default_options: ['warning_level=0', 'werror=false'])
     ],
 )
 

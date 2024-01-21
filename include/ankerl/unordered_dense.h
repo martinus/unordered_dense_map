@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset based on robin-hood backward shift deletion.
-// Version 4.1.2
+// Version 4.4.0
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -31,8 +31,8 @@
 
 // see https://semver.org/spec/v2.0.0.html
 #define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 4 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
-#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 1 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
-#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 2 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
+#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 4 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
+#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
 
@@ -89,6 +89,7 @@
 #        include <iterator>         // for pair, distance
 #        include <limits>           // for numeric_limits
 #        include <memory>           // for allocator, allocator_traits, shared_ptr
+#        include <optional>         // for optional
 #        include <stdexcept>        // for out_of_range
 #        include <string>           // for basic_string
 #        include <string_view>      // for basic_string_view, hash
@@ -329,6 +330,50 @@ struct hash<Enum, typename std::enable_if<std::is_enum<Enum>::value>::type> {
     auto operator()(Enum e) const noexcept -> std::uint64_t {
         using underlying = typename std::underlying_type_t<Enum>;
         return detail::wyhash::hash(static_cast<underlying>(e));
+    }
+};
+
+template <typename... Args>
+struct tuple_hash_helper {
+    // Converts the value into 64bit. If it is an integral type, just cast it. Mixing is doing the rest.
+    // If it isn't an integral we need to hash it.
+    template <typename Arg>
+    [[nodiscard]] constexpr static auto to64(Arg const& arg) -> uint64_t {
+        if constexpr (std::is_integral_v<Arg> || std::is_enum_v<Arg>) {
+            return static_cast<uint64_t>(arg);
+        } else {
+            return hash<Arg>{}(arg);
+        }
+    }
+
+    [[nodiscard]] static auto mix64(uint64_t state, uint64_t v) -> uint64_t {
+        return detail::wyhash::mix(state + v, uint64_t{0x9ddfea08eb382d69});
+    }
+
+    // Creates a buffer that holds all the data from each element of the tuple. If possible we memcpy the data directly. If
+    // not, we hash the object and use this for the array. Size of the array is known at compile time, and memcpy is optimized
+    // away, so filling the buffer is highly efficient. Finally, call wyhash with this buffer.
+    template <typename T, std::size_t... Idx>
+    [[nodiscard]] static auto calc_hash(T const& t, std::index_sequence<Idx...>) noexcept -> uint64_t {
+        auto h = uint64_t{};
+        ((h = mix64(h, to64(std::get<Idx>(t)))), ...);
+        return h;
+    }
+};
+
+template <typename... Args>
+struct hash<std::tuple<Args...>> : tuple_hash_helper<Args...> {
+    using is_avalanching = void;
+    auto operator()(std::tuple<Args...> const& t) const noexcept -> uint64_t {
+        return tuple_hash_helper<Args...>::calc_hash(t, std::index_sequence_for<Args...>{});
+    }
+};
+
+template <typename A, typename B>
+struct hash<std::pair<A, B>> : tuple_hash_helper<A, B> {
+    using is_avalanching = void;
+    auto operator()(std::pair<A, B> const& t) const noexcept -> uint64_t {
+        return tuple_hash_helper<A, B>::calc_hash(t, std::index_sequence_for<A, B>{});
     }
 };
 
@@ -771,7 +816,7 @@ private:
         typename std::allocator_traits<typename value_container_type::allocator_type>::template rebind_alloc<Bucket>;
     using bucket_alloc_traits = std::allocator_traits<bucket_alloc>;
 
-    static constexpr std::uint8_t initial_shifts = 64 - 3; // 2^(64-m_shift) number of buckets
+    static constexpr std::uint8_t initial_shifts = 64 - 2; // 2^(64-m_shift) number of buckets
     static constexpr float default_max_load_factor = 0.8F;
 
 public:
@@ -897,7 +942,12 @@ private:
 
     // assumes m_values has data, m_buckets=m_buckets_end=nullptr, m_shifts is INITIAL_SHIFTS
     void copy_buckets(table const& other) {
-        if (!empty()) {
+        // assumes m_values has already the correct data copied over.
+        if (empty()) {
+            // when empty, at least allocate an initial buckets and clear them.
+            allocate_buckets_from_shift();
+            clear_buckets();
+        } else {
             m_shifts = other.m_shifts;
             allocate_buckets_from_shift();
             std::memcpy(m_buckets, other.m_buckets, sizeof(Bucket) * bucket_count());
@@ -908,7 +958,7 @@ private:
      * True when no element can be added any more without increasing the size
      */
     [[nodiscard]] auto is_full() const -> bool {
-        return size() >= m_max_bucket_capacity;
+        return size() > m_max_bucket_capacity;
     }
 
     void deallocate_buckets() {
@@ -952,7 +1002,9 @@ private:
     }
 
     void increase_size() {
-        if (ANKERL_UNORDERED_DENSE_UNLIKELY(m_max_bucket_capacity == max_bucket_count())) {
+        if (m_max_bucket_capacity == max_bucket_count()) {
+            // remove the value again, we can't add it!
+            m_values.pop_back();
             on_error_bucket_overflow();
         }
         --m_shifts;
@@ -961,7 +1013,8 @@ private:
         clear_and_fill_buckets_from_values();
     }
 
-    void do_erase(value_idx_type bucket_idx) {
+    template <typename Op>
+    void do_erase(value_idx_type bucket_idx, Op handle_erased_value) {
         auto const value_idx_to_remove = at(m_buckets, bucket_idx).m_value_idx;
 
         // shift down until either empty or an element with correct spot is found
@@ -972,6 +1025,7 @@ private:
             bucket_idx = std::exchange(next_bucket_idx, next(next_bucket_idx));
         }
         at(m_buckets, bucket_idx) = {};
+        handle_erased_value(std::move(m_values[value_idx_to_remove]));
 
         // update m_values
         if (value_idx_to_remove != m_values.size() - 1) {
@@ -992,8 +1046,8 @@ private:
         m_values.pop_back();
     }
 
-    template <typename K>
-    auto do_erase_key(K&& key) -> std::size_t {
+    template <typename K, typename Op>
+    auto do_erase_key(K&& key, Op handle_erased_value) -> std::size_t {
         if (empty()) {
             return 0;
         }
@@ -1009,7 +1063,7 @@ private:
         if (dist_and_fingerprint != at(m_buckets, bucket_idx).m_dist_and_fingerprint) {
             return 0;
         }
-        do_erase(bucket_idx);
+        do_erase(bucket_idx, handle_erased_value);
         return 1;
     }
 
@@ -1022,27 +1076,26 @@ private:
         return it_isinserted;
     }
 
-    template <typename K, typename... Args>
-    auto do_place_element(dist_and_fingerprint_type dist_and_fingerprint, value_idx_type bucket_idx, K&& key, Args&&... args)
+    template <typename... Args>
+    auto do_place_element(dist_and_fingerprint_type dist_and_fingerprint, value_idx_type bucket_idx, Args&&... args)
         -> std::pair<iterator, bool> {
 
         // emplace the new value. If that throws an exception, no harm done; index is still in a valid state
-        m_values.emplace_back(std::piecewise_construct,
-                              std::forward_as_tuple(std::forward<K>(key)),
-                              std::forward_as_tuple(std::forward<Args>(args)...));
+        m_values.emplace_back(std::forward<Args>(args)...);
+
+        auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
+        if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full())) {
+            increase_size();
+        } else {
+            place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
+        }
 
         // place element and shift up until we find an empty spot
-        auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
-        place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
         return {begin() + static_cast<difference_type>(value_idx), true};
     }
 
     template <typename K, typename... Args>
     auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
-        if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full())) {
-            increase_size();
-        }
-
         auto hash = mixed_hash(key);
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
@@ -1054,7 +1107,11 @@ private:
                     return {begin() + static_cast<difference_type>(bucket->m_value_idx), false};
                 }
             } else if (dist_and_fingerprint > bucket->m_dist_and_fingerprint) {
-                return do_place_element(dist_and_fingerprint, bucket_idx, std::forward<K>(key), std::forward<Args>(args)...);
+                return do_place_element(dist_and_fingerprint,
+                                        bucket_idx,
+                                        std::piecewise_construct,
+                                        std::forward_as_tuple(std::forward<K>(key)),
+                                        std::forward_as_tuple(std::forward<Args>(args)...));
             }
             dist_and_fingerprint = dist_inc(dist_and_fingerprint);
             bucket_idx = next(bucket_idx);
@@ -1120,9 +1177,6 @@ private:
     }
 
 public:
-    table()
-        : table(0) {}
-
     explicit table(std::size_t bucket_count,
                    Hash const& hash = Hash(),
                    KeyEqual const& equal = KeyEqual(),
@@ -1132,9 +1186,15 @@ public:
         , m_equal(equal) {
         if (0 != bucket_count) {
             reserve(bucket_count);
+        } else {
+            allocate_buckets_from_shift();
+            clear_buckets();
         }
     }
 
+    table()
+        : table(0) {}
+  
     table(std::size_t bucket_count, allocator_type const& alloc)
         : table(bucket_count, Hash(), KeyEqual(), alloc) {}
 
@@ -1217,9 +1277,9 @@ public:
         return *this;
     }
 
-    auto operator=(table&& other) noexcept(
-        noexcept(std::is_nothrow_move_assignable_v<value_container_type>&& std::is_nothrow_move_assignable_v<Hash>&&
-                     std::is_nothrow_move_assignable_v<KeyEqual>)) -> table& {
+    auto operator=(table&& other) noexcept(noexcept(std::is_nothrow_move_assignable_v<value_container_type> &&
+                                                    std::is_nothrow_move_assignable_v<Hash> &&
+                                                    std::is_nothrow_move_assignable_v<KeyEqual>)) -> table& {
         if (&other != this) {
             deallocate_buckets(); // deallocate before m_values is set (might have another allocator)
             m_values = std::move(other.m_values);
@@ -1234,6 +1294,8 @@ public:
                 m_max_load_factor = std::exchange(other.m_max_load_factor, default_max_load_factor);
                 m_hash = std::exchange(other.m_hash, {});
                 m_equal = std::exchange(other.m_equal, {});
+                other.allocate_buckets_from_shift();
+                other.clear_buckets();
             } else {
                 // set max_load_factor *before* copying the other's buckets, so we have the same
                 // behavior
@@ -1457,10 +1519,6 @@ public:
               typename KE = KeyEqual,
               std::enable_if_t<!is_map_v<Q> && is_transparent_v<H, KE>, bool> = true>
     auto emplace(K&& key) -> std::pair<iterator, bool> {
-        if (is_full()) {
-            increase_size();
-        }
-
         auto hash = mixed_hash(key);
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
@@ -1476,19 +1534,11 @@ public:
         }
 
         // value is new, insert element first, so when exception happens we are in a valid state
-        m_values.emplace_back(std::forward<K>(key));
-        // now place the bucket and shift up until we find an empty spot
-        auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
-        place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
-        return {begin() + static_cast<difference_type>(value_idx), true};
+        return do_place_element(dist_and_fingerprint, bucket_idx, std::forward<K>(key));
     }
 
     template <class... Args>
     auto emplace(Args&&... args) -> std::pair<iterator, bool> {
-        if (is_full()) {
-            increase_size();
-        }
-
         // we have to instantiate the value_type to be able to access the key.
         // 1. emplace_back the object so it is constructed. 2. If the key is already there, pop it later in the loop.
         auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)...));
@@ -1508,8 +1558,13 @@ public:
 
         // value is new, place the bucket and shift up until we find an empty spot
         auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
-        place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
-
+        if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full())) {
+            // increase_size just rehashes all the data we have in m_values
+            increase_size();
+        } else {
+            // place element and shift up until we find an empty spot
+            place_and_shift_up({dist_and_fingerprint, value_idx}, bucket_idx);
+        }
         return {begin() + static_cast<difference_type>(value_idx), true};
     }
 
@@ -1571,13 +1626,35 @@ public:
             bucket_idx = next(bucket_idx);
         }
 
-        do_erase(bucket_idx);
+        do_erase(bucket_idx, [](value_type&& /*unused*/) {
+        });
         return begin() + static_cast<difference_type>(value_idx_to_remove);
+    }
+
+    auto extract(iterator it) -> value_type {
+        auto hash = mixed_hash(get_key(*it));
+        auto bucket_idx = bucket_idx_from_hash(hash);
+
+        auto const value_idx_to_remove = static_cast<value_idx_type>(it - cbegin());
+        while (at(m_buckets, bucket_idx).m_value_idx != value_idx_to_remove) {
+            bucket_idx = next(bucket_idx);
+        }
+
+        auto tmp = std::optional<value_type>{};
+        do_erase(bucket_idx, [&tmp](value_type&& val) {
+            tmp = std::move(val);
+        });
+        return std::move(tmp).value();
     }
 
     template <typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
     auto erase(const_iterator it) -> iterator {
         return erase(begin() + (it - cbegin()));
+    }
+
+    template <typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
+    auto extract(const_iterator it) -> value_type {
+        return extract(begin() + (it - cbegin()));
     }
 
     auto erase(const_iterator first, const_iterator last) -> iterator {
@@ -1605,16 +1682,33 @@ public:
     }
 
     auto erase(Key const& key) -> std::size_t {
-        return do_erase_key(key);
+        return do_erase_key(key, [](value_type&& /*unused*/) {
+        });
+    }
+  
+    auto extract(Key const& key) -> std::optional<value_type> {
+        auto tmp = std::optional<value_type>{};
+        do_erase_key(key, [&tmp](value_type&& val) {
+            tmp = std::move(val);
+        });
+        return tmp;
     }
 
     template <class K, class H = Hash, class KE = KeyEqual, std::enable_if_t<is_transparent_v<H, KE>, bool> = true>
     auto erase(K&& key) -> std::size_t {
         return do_erase_key(std::forward<K>(key));
+
+    template <class K, class H = Hash, class KE = KeyEqual, std::enable_if_t<is_transparent_v<H, KE>, bool> = true>
+    auto extract(K&& key) -> std::optional<value_type> {
+        auto tmp = std::optional<value_type>{};
+        do_erase_key(std::forward<K>(key), [&tmp](value_type&& val) {
+            tmp = std::move(val);
+        });
+        return tmp;
     }
 
-    void swap(table& other) noexcept(noexcept(std::is_nothrow_swappable_v<value_container_type>&&
-                                                  std::is_nothrow_swappable_v<Hash>&& std::is_nothrow_swappable_v<KeyEqual>)) {
+    void swap(table& other) noexcept(noexcept(std::is_nothrow_swappable_v<value_container_type> &&
+                                              std::is_nothrow_swappable_v<Hash> && std::is_nothrow_swappable_v<KeyEqual>)) {
         using std::swap;
         swap(other, *this);
     }
